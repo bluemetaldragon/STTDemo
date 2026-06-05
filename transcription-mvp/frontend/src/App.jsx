@@ -206,13 +206,8 @@ export default function TranscriptionApp() {
     const hostname = window.location.hostname;
     const protocol = window.location.protocol;
     
-    console.log('[APP] hostname:', hostname, 'protocol:', protocol);
-    
-    if (hostname.includes('app.github.dev')) {
-      const backendHostname = hostname.replace('-3000.', '-8000.');
-      const url = `${protocol}//${backendHostname}:8000`;
-      console.log('[APP] Codespaces backend URL:', url);
-      return url;
+    if (hostname.includes('vercel.app')) {
+      return 'https://sttdemo-production.up.railway.app';
     }
     
     console.log('[APP] Using localhost');
