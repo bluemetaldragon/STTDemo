@@ -204,7 +204,7 @@ export default function TranscriptionApp() {
   // Dynamically construct backend URL for Codespaces or localhost
   const getServerUrl = () => {
     const hostname = window.location.hostname;
-    const protocol = window.location.protocol;
+
     
     if (hostname.includes('vercel.app')) {
       return 'https://sttdemo-production.up.railway.app';
@@ -218,8 +218,8 @@ export default function TranscriptionApp() {
   console.log('[APP] Final serverUrl:', serverUrl);
   
   const { isRecording, startRecording, stopRecording, debugLogs } = useAudioCapture();
-  const { wsStatus, transcript, error, connect, disconnect, isConnected, wsLogs } = useWebSocketTranscript(serverUrl);
-  
+  const { transcript, error, connect, disconnect, isConnected, wsLogs } = useWebSocketTranscript(serverUrl);
+    
   const transcriptRef = useRef(null);
   const [copyStatus, setCopyStatus] = useState('');
 
