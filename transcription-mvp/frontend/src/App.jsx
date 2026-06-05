@@ -1,11 +1,9 @@
 import React, { useState, useRef, useEffect, useCallback } from 'react';
-
 function useAudioCapture() {
   const [isRecording, setIsRecording] = useState(false);
   const [debugLogs, setDebugLogs] = useState([]);
   const audioContextRef = useRef(null);
   const streamRef = useRef(null);
-  const processorRef = useRef(null);
 
   const addLog = (msg) => {
     console.log('[AUDIO]', msg);
@@ -15,84 +13,89 @@ function useAudioCapture() {
   const startRecording = useCallback(async () => {
     addLog('startRecording called');
     try {
-      if (streamRef.current) streamRef.current.getTracks().forEach(track => track.stop());
-      if (audioContextRef.current && audioContextRef.current.state !== 'closed') await audioContextRef.current.close();
-
+      // Get microphone stream
       addLog('Requesting microphone access...');
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
       addLog('✓ Microphone access granted');
       streamRef.current = stream;
 
+      // Create audio context
       addLog('Creating audio context...');
       const audioContext = new (window.AudioContext || window.webkitAudioContext)();
       audioContextRef.current = audioContext;
       addLog(`✓ Audio context created (${audioContext.sampleRate}Hz)`);
 
-      let source;
-      if (typeof audioContext.createMediaStreamSource === 'function') {
-        source = audioContext.createMediaStreamSource(stream);
-        addLog('✓ Using createMediaStreamSource');
-      } else {
-        source = audioContext.createMediaStreamAudioSource(stream);
-        addLog('✓ Using createMediaStreamAudioSource');
-      }
+      // Create source from stream
+      const source = audioContext.createMediaStreamSource(stream);
+      addLog('✓ Media stream source created');
 
-      const processor = audioContext.createScriptProcessor(4096, 1, 1);
-      processorRef.current = processor;
-      source.connect(processor);
-      processor.connect(audioContext.destination);
-      addLog('✓ Audio chain connected');
+      // Use MediaRecorder for reliable audio capture
+      const mediaRecorder = new MediaRecorder(stream, {
+        mimeType: 'audio/webm;codecs=opus'
+      });
 
-      const audioChunks = [];
-      let sendCount = 0;
+      addLog('✓ MediaRecorder created');
 
-      processor.onaudioprocess = (event) => {
-        try {
-          if (!event?.inputData?.[0]) return;
-          const pcm16 = float32ToPcm16(event.inputData[0]);
-          audioChunks.push(pcm16);
-
-          if (audioChunks.length >= 2) {
-            const combined = concatenateArrays(audioChunks);
-            if (window.wsRef && window.wsRef.readyState === WebSocket.OPEN) {
-              sendCount++;
-              const base64 = btoa(String.fromCharCode(...new Uint8Array(combined)));
-              window.wsRef.send(JSON.stringify({ type: 'audio', data: base64 }));
-              if (sendCount % 10 === 0) addLog(`✓ Sent ${sendCount} chunks`);
-            }
-            audioChunks.length = 0;
-          }
-        } catch (err) {
-          addLog(`Error: ${err.message}`);
+      mediaRecorder.ondataavailable = (event) => {
+        if (event.data.size > 0 && window.wsRef && window.wsRef.readyState === WebSocket.OPEN) {
+          // Read blob as ArrayBuffer
+          const reader = new FileReader();
+          reader.onload = (e) => {
+            const arrayBuffer = e.target.result;
+            const base64 = btoa(String.fromCharCode(...new Uint8Array(arrayBuffer)));
+            window.wsRef.send(JSON.stringify({
+              type: 'audio',
+              data: base64
+            }));
+          };
+          reader.readAsArrayBuffer(event.data);
         }
       };
 
+      // Send audio chunks every 250ms
+      mediaRecorder.start(250);
+      addLog('✓ MediaRecorder started (sending every 250ms)');
+
       setIsRecording(true);
       addLog('✓ Recording started');
+      
+      // Store mediaRecorder for cleanup
+      streamRef.current.mediaRecorder = mediaRecorder;
       return true;
     } catch (error) {
-      addLog(`❌ Error: ${error.name} - ${error.message}`);
+      const errMsg = `❌ Error: ${error.name} - ${error.message}`;
+      addLog(errMsg);
+      console.error(errMsg, error);
       return false;
     }
   }, []);
 
   const stopRecording = useCallback(() => {
     addLog('stopRecording called');
-    if (processorRef.current) {
-      processorRef.current.disconnect();
-      processorRef.current.onaudioprocess = null;
-      processorRef.current = null;
+    try {
+      if (streamRef.current?.mediaRecorder) {
+        streamRef.current.mediaRecorder.stop();
+        addLog('✓ MediaRecorder stopped');
+      }
+
+      if (streamRef.current) {
+        streamRef.current.getTracks().forEach(track => {
+          addLog(`Stopping: ${track.kind}`);
+          track.stop();
+        });
+        streamRef.current = null;
+      }
+
+      if (audioContextRef.current && audioContextRef.current.state !== 'closed') {
+        audioContextRef.current.close();
+        audioContextRef.current = null;
+      }
+
+      setIsRecording(false);
+      addLog('✓ Stopped');
+    } catch (error) {
+      addLog(`Stop error: ${error.message}`);
     }
-    if (streamRef.current) {
-      streamRef.current.getTracks().forEach(track => track.stop());
-      streamRef.current = null;
-    }
-    if (audioContextRef.current && audioContextRef.current.state !== 'closed') {
-      audioContextRef.current.close();
-      audioContextRef.current = null;
-    }
-    setIsRecording(false);
-    addLog('✓ Stopped');
   }, []);
 
   return { isRecording, startRecording, stopRecording, debugLogs };
