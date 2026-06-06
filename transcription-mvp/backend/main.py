@@ -46,11 +46,7 @@ except Exception as e:
 # Health check
 @app.get("/health")
 async def health():
-    logger.info("Health check called")
-    return {
-        "status": "ok",
-        "deepgram_configured": deepgram_client is not None
-    }
+    return {"status": "ok", "deepgram_configured": deepgram_client is not None}
 
 # Helper to safely send JSON from any thread
 async def safe_send_json(websocket: WebSocket, data: dict):
@@ -63,16 +59,11 @@ async def safe_send_json(websocket: WebSocket, data: dict):
 @app.websocket("/ws/transcribe")
 async def websocket_transcribe(websocket: WebSocket):
     logger.info(f"🔌 WebSocket connection from {websocket.client}")
-    
     await websocket.accept()
     logger.info("✓ WebSocket accepted")
     
     if not deepgram_client:
-        logger.error("❌ Deepgram not configured")
-        await websocket.send_json({
-            "type": "error",
-            "message": "Deepgram not configured"
-        })
+        await websocket.send_json({"type": "error", "message": "Deepgram not configured"})
         await websocket.close()
         return
     
@@ -80,40 +71,33 @@ async def websocket_transcribe(websocket: WebSocket):
     main_loop = asyncio.get_running_loop()
     
     # Create Deepgram connection
-    logger.info("Creating Deepgram live connection...")
     dg_connection = deepgram_client.listen.live.v("1")
-    logger.info("✓ Deepgram connection created")
     
-    # Setup handlers
+    # Setup handlers with correct signatures
     def on_open(self, open, **kwargs):
         logger.info("✓ Deepgram connection opened")
     
-    def on_message(self, msg, **kwargs):
+    def on_message(self, result, **kwargs):
         try:
-            if msg.type == LiveTranscriptionEvents.Transcript:
-                transcript_text = msg.channel.alternatives[0].transcript
-                is_final = msg.is_final
-                if transcript_text:
-                    logger.info(f"📝 Transcript: {transcript_text} (final: {is_final})")
-                    # Schedule coroutine in the main event loop
-                    asyncio.run_coroutine_threadsafe(
-                        safe_send_json(websocket, {
-                            "type": "transcript",
-                            "text": transcript_text,
-                            "final": is_final
-                        }),
-                        main_loop
-                    )
+            transcript = result.channel.alternatives[0].transcript
+            is_final = result.is_final
+            if transcript:
+                logger.info(f"📝 Transcript: {transcript} (final: {is_final})")
+                asyncio.run_coroutine_threadsafe(
+                    safe_send_json(websocket, {
+                        "type": "transcript",
+                        "text": transcript,
+                        "final": is_final
+                    }),
+                    main_loop
+                )
         except Exception as e:
             logger.error(f"Error in on_message: {e}")
     
     def on_error(self, error, **kwargs):
         logger.error(f"❌ Deepgram error: {error}")
         asyncio.run_coroutine_threadsafe(
-            safe_send_json(websocket, {
-                "type": "error",
-                "message": str(error)
-            }),
+            safe_send_json(websocket, {"type": "error", "message": str(error)}),
             main_loop
         )
     
@@ -121,7 +105,7 @@ async def websocket_transcribe(websocket: WebSocket):
     dg_connection.on(LiveTranscriptionEvents.Transcript, on_message)
     dg_connection.on(LiveTranscriptionEvents.Error, on_error)
     
-    logger.info("Starting Deepgram listen...")
+    # Start Deepgram
     dg_connection.start({
         "model": DEEPGRAM_MODEL,
         "language": DEEPGRAM_LANGUAGE,
@@ -138,18 +122,17 @@ async def websocket_transcribe(websocket: WebSocket):
         while True:
             data = await websocket.receive_text()
             msg = json.loads(data)
-            
             if msg.get("type") == "audio":
-                audio_data = base64.b64decode(msg.get("data", ""))
-                logger.info(f"🎤 Received audio chunk: {len(audio_data)} bytes")
-                dg_connection.send(audio_data)
+                audio_bytes = base64.b64decode(msg["data"])
+                logger.info(f"🎤 Received audio chunk: {len(audio_bytes)} bytes")
+                dg_connection.send(audio_bytes)
             elif msg.get("type") == "stop":
                 logger.info("Stop signal received")
                 break
     except WebSocketDisconnect:
         logger.info("WebSocket disconnected")
     except Exception as e:
-        logger.error(f"Unexpected error: {e}", exc_info=True)
+        logger.error(f"Unexpected error: {e}")
     finally:
         logger.info("Cleaning up Deepgram connection...")
         dg_connection.finish()
