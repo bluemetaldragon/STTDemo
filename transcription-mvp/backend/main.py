@@ -18,17 +18,22 @@ if not DEEPGRAM_API_KEY:
     logger.error("❌ DEEPGRAM_API_KEY not set!")
     exit(1)
 
-# Deepgram WebSocket URL
+# Deepgram WebSocket URL with API key as a query parameter
 DEEPGRAM_URL = (
     f"wss://api.deepgram.com/v1/listen?"
-    f"encoding=linear16&sample_rate=16000&channels=1&"
-    f"interim_results=true&vad=true&model=nova-3"
+    f"api_key={DEEPGRAM_API_KEY}"
+    f"&encoding=linear16&sample_rate=16000&channels=1"
+    f"&interim_results=true&vad=true&model=nova-3"
 )
 
-HEADERS = {"Authorization": f"Token {DEEPGRAM_API_KEY}"}
-
 app = FastAPI()
-app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 logger.info("✓ FastAPI app initialized")
 
 async def safe_send_json(websocket: WebSocket, data: dict):
@@ -47,7 +52,7 @@ async def websocket_transcribe(websocket: WebSocket):
 
     try:
         logger.info("⏳ Connecting to Deepgram...")
-        dg_ws = await websockets.connect(DEEPGRAM_URL, extra_headers=HEADERS)
+        dg_ws = await websockets.connect(DEEPGRAM_URL)
         logger.info("✅ Connected to Deepgram")
 
         async def forward_transcripts():
@@ -56,23 +61,18 @@ async def websocket_transcribe(websocket: WebSocket):
                     if isinstance(message, str):
                         try:
                             data = json.loads(message)
-                            # Log every message from Deepgram (for debugging)
                             logger.info(f"📨 Deepgram message: {json.dumps(data)[:200]}")
-
-                            # Check for error messages
                             if data.get("type") == "Error":
                                 logger.error(f"❌ Deepgram error: {data.get('description', 'No description')}")
                                 await safe_send_json(websocket, {"type": "error", "message": data})
                                 continue
-
-                            # Extract transcript
                             transcript = data.get("channel", {}).get("alternatives", [{}])[0].get("transcript")
                             if transcript:
                                 is_final = data.get("is_final", False)
                                 logger.info(f"📝 Transcript: '{transcript}' (final: {is_final})")
                                 await safe_send_json(websocket, {"type": "transcript", "text": transcript, "final": is_final})
                         except json.JSONDecodeError:
-                            logger.warning(f"Received non‑JSON message from Deepgram: {message[:200]}")
+                            logger.warning(f"Non-JSON message from Deepgram: {message[:200]}")
             except websockets.exceptions.ConnectionClosed as e:
                 logger.warning(f"Deepgram WebSocket closed: code={e.code}, reason={e.reason}")
             except Exception as e:
@@ -80,7 +80,6 @@ async def websocket_transcribe(websocket: WebSocket):
 
         deepgram_listener_task = asyncio.create_task(forward_transcripts())
 
-        # Receive audio from frontend
         while True:
             raw = await websocket.receive_text()
             msg = json.loads(raw)
@@ -93,7 +92,6 @@ async def websocket_transcribe(websocket: WebSocket):
                     sample = int.from_bytes(audio_bytes[i*2:(i+1)*2], 'little', signed=True)
                     samples.append(sample)
                 logger.info(f"🎤 Received {len(audio_bytes)} bytes, first {sample_count} samples: {samples}")
-                # Send to Deepgram
                 await dg_ws.send(audio_bytes)
                 logger.info(f"✅ Sent audio chunk to Deepgram ({len(audio_bytes)} bytes)")
             elif msg.get("type") == "stop":
