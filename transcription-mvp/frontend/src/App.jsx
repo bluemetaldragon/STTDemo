@@ -1,66 +1,69 @@
 import React, { useState, useRef, useEffect, useCallback } from 'react';
+
+// ----------------------------------------------------------------------
+// Audio Capture Hook using AudioWorklet (no ScriptProcessorNode)
+// ----------------------------------------------------------------------
 function useAudioCapture() {
   const [isRecording, setIsRecording] = useState(false);
   const [debugLogs, setDebugLogs] = useState([]);
   const audioContextRef = useRef(null);
   const streamRef = useRef(null);
+  const workletNodeRef = useRef(null);
+  const sourceRef = useRef(null);
 
   const addLog = (msg) => {
     console.log('[AUDIO]', msg);
     setDebugLogs(prev => [...prev, `[${new Date().toLocaleTimeString()}] ${msg}`].slice(-15));
   };
 
+  // Send PCM chunk via WebSocket
+  const sendPcmChunk = (arrayBuffer) => {
+    if (!window.wsRef || window.wsRef.readyState !== WebSocket.OPEN) return;
+    const uint8 = new Uint8Array(arrayBuffer);
+    const base64 = btoa(String.fromCharCode(...uint8));
+    window.wsRef.send(JSON.stringify({ type: 'audio', data: base64 }));
+  };
+
   const startRecording = useCallback(async () => {
     addLog('startRecording called');
     try {
       // Get microphone stream
-      addLog('Requesting microphone access...');
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
       addLog('✓ Microphone access granted');
       streamRef.current = stream;
 
-      // Create audio context
-      addLog('Creating audio context...');
+      // Create AudioContext
       const audioContext = new (window.AudioContext || window.webkitAudioContext)();
       audioContextRef.current = audioContext;
-      addLog(`✓ Audio context created (${audioContext.sampleRate}Hz)`);
+      addLog(`✓ AudioContext created (${audioContext.sampleRate} Hz)`);
 
-      // Create source from stream
-      const source = audioContext.createMediaStreamSource(stream);
-      addLog('✓ Media stream source created');
+      // Load AudioWorklet module
+      await audioContext.audioWorklet.addModule('/pcm-worklet.js');
+      addLog('✓ AudioWorklet module loaded');
 
-      // Use MediaRecorder for reliable audio capture
-      const mediaRecorder = new MediaRecorder(stream, {
-        mimeType: 'audio/webm;codecs=opus'
-      });
+      // Create worklet node
+      const workletNode = new AudioWorkletNode(audioContext, 'pcm-worklet');
+      workletNodeRef.current = workletNode;
 
-      addLog('✓ MediaRecorder created');
-
-      mediaRecorder.ondataavailable = (event) => {
-        if (event.data.size > 0 && window.wsRef && window.wsRef.readyState === WebSocket.OPEN) {
-          // Read blob as ArrayBuffer
-          const reader = new FileReader();
-          reader.onload = (e) => {
-            const arrayBuffer = e.target.result;
-            const base64 = btoa(String.fromCharCode(...new Uint8Array(arrayBuffer)));
-            window.wsRef.send(JSON.stringify({
-              type: 'audio',
-              data: base64
-            }));
-          };
-          reader.readAsArrayBuffer(event.data);
+      // Listen for PCM chunks from worklet
+      workletNode.port.onmessage = (event) => {
+        if (event.data && event.data.byteLength) {
+          sendPcmChunk(event.data);
         }
       };
 
-      // Send audio chunks every 250ms
-      mediaRecorder.start(250);
-      addLog('✓ MediaRecorder started (sending every 250ms)');
+      // Create source from stream
+      const source = audioContext.createMediaStreamSource(stream);
+      sourceRef.current = source;
 
+      // Connect: source -> workletNode -> destination (optional, but needed to keep audio alive)
+      source.connect(workletNode);
+      workletNode.connect(audioContext.destination);
+
+      // Resume context
+      await audioContext.resume();
       setIsRecording(true);
-      addLog('✓ Recording started');
-      
-      // Store mediaRecorder for cleanup
-      streamRef.current.mediaRecorder = mediaRecorder;
+      addLog('✓ Recording started (AudioWorklet, PCM 16kHz 16-bit, 250ms chunks)');
       return true;
     } catch (error) {
       const errMsg = `❌ Error: ${error.name} - ${error.message}`;
@@ -72,35 +75,33 @@ function useAudioCapture() {
 
   const stopRecording = useCallback(() => {
     addLog('stopRecording called');
-    try {
-      if (streamRef.current?.mediaRecorder) {
-        streamRef.current.mediaRecorder.stop();
-        addLog('✓ MediaRecorder stopped');
-      }
-
-      if (streamRef.current) {
-        streamRef.current.getTracks().forEach(track => {
-          addLog(`Stopping: ${track.kind}`);
-          track.stop();
-        });
-        streamRef.current = null;
-      }
-
-      if (audioContextRef.current && audioContextRef.current.state !== 'closed') {
-        audioContextRef.current.close();
-        audioContextRef.current = null;
-      }
-
-      setIsRecording(false);
-      addLog('✓ Stopped');
-    } catch (error) {
-      addLog(`Stop error: ${error.message}`);
+    if (workletNodeRef.current) {
+      workletNodeRef.current.port.postMessage('stop');
+      workletNodeRef.current.disconnect();
+      workletNodeRef.current = null;
     }
+    if (sourceRef.current) {
+      sourceRef.current.disconnect();
+      sourceRef.current = null;
+    }
+    if (audioContextRef.current) {
+      audioContextRef.current.close();
+      audioContextRef.current = null;
+    }
+    if (streamRef.current) {
+      streamRef.current.getTracks().forEach(track => track.stop());
+      streamRef.current = null;
+    }
+    setIsRecording(false);
+    addLog('✓ Stopped');
   }, []);
 
   return { isRecording, startRecording, stopRecording, debugLogs };
 }
 
+// ----------------------------------------------------------------------
+// WebSocket Hook (unchanged)
+// ----------------------------------------------------------------------
 function useWebSocketTranscript(serverUrl) {
   const [wsStatus, setWsStatus] = useState('idle');
   const [transcript, setTranscript] = useState('');
@@ -118,17 +119,11 @@ function useWebSocketTranscript(serverUrl) {
     try {
       setWsStatus('connecting');
       setError(null);
-      
       const wsUrl = serverUrl.replace('http', 'ws') + '/ws/transcribe';
-      console.log('[WS] serverUrl input:', serverUrl);
-      console.log('[WS] constructing wsUrl:', wsUrl);
       addWsLog('Connecting to ' + wsUrl);
-
       const ws = new WebSocket(wsUrl);
       wsRef.current = ws;
       window.wsRef = ws;
-      
-      console.log('[WS] WebSocket object created, url:', wsUrl);
 
       ws.onopen = () => {
         addWsLog('✓ WebSocket CONNECTED');
@@ -149,8 +144,8 @@ function useWebSocketTranscript(serverUrl) {
       };
 
       ws.onerror = (event) => {
-        console.error('[WS] WebSocket error event:', event);
-        addWsLog(`❌ Connection error`);
+        console.error('[WS] WebSocket error:', event);
+        addWsLog('❌ Connection error');
         setWsStatus('error');
         setError('WebSocket error');
       };
@@ -174,55 +169,28 @@ function useWebSocketTranscript(serverUrl) {
   }, [serverUrl]);
 
   const disconnect = useCallback(() => {
-    if (wsRef.current) {
-      wsRef.current.close();
-    }
+    if (wsRef.current) wsRef.current.close();
     window.wsRef = null;
   }, []);
 
   return { wsStatus, transcript, error, connect, disconnect, isConnected: wsStatus === 'connected', wsLogs };
 }
 
-function float32ToPcm16(float32Array) {
-  const pcm16 = new Int16Array(float32Array.length);
-  for (let i = 0; i < float32Array.length; i++) {
-    const s = Math.max(-1, Math.min(1, float32Array[i]));
-    pcm16[i] = s < 0 ? s * 0x8000 : s * 0x7FFF;
-  }
-  return pcm16.buffer;
-}
-
-function concatenateArrays(arrays) {
-  let totalLength = arrays.reduce((sum, arr) => sum + new Uint8Array(arr).length, 0);
-  let result = new Uint8Array(totalLength);
-  let offset = 0;
-  arrays.forEach(arr => {
-    result.set(new Uint8Array(arr), offset);
-    offset += new Uint8Array(arr).length;
-  });
-  return result.buffer;
-}
-
+// ----------------------------------------------------------------------
+// Main App Component (UI unchanged)
+// ----------------------------------------------------------------------
 export default function TranscriptionApp() {
-  // Dynamically construct backend URL for Codespaces or localhost
   const getServerUrl = () => {
     const hostname = window.location.hostname;
-
-    
     if (hostname.includes('vercel.app')) {
       return 'https://sttdemo-production.up.railway.app';
     }
-    
-    console.log('[APP] Using localhost');
     return 'http://localhost:8000';
   };
 
   const serverUrl = getServerUrl();
-  console.log('[APP] Final serverUrl:', serverUrl);
-  
   const { isRecording, startRecording, stopRecording, debugLogs } = useAudioCapture();
   const { transcript, error, connect, disconnect, isConnected, wsLogs } = useWebSocketTranscript(serverUrl);
-    
   const transcriptRef = useRef(null);
   const [copyStatus, setCopyStatus] = useState('');
 
