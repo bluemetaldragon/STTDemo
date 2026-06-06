@@ -1,32 +1,38 @@
+import os
 import json
 import base64
-import logging
 import asyncio
+import logging
+
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from dotenv import load_dotenv
-import os
 import websockets
+
+load_dotenv()
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-load_dotenv()
 DEEPGRAM_API_KEY = os.getenv("DEEPGRAM_API_KEY")
-
 if not DEEPGRAM_API_KEY:
-    logger.error("❌ DEEPGRAM_API_KEY not set!")
-    exit(1)
+    raise RuntimeError("DEEPGRAM_API_KEY not set")
 
-# Deepgram WebSocket URL with API key as a query parameter
-DEEPGRAM_URL = (
-    f"wss://api.deepgram.com/v1/listen?"
-    f"api_key={DEEPGRAM_API_KEY}"
-    f"&encoding=linear16&sample_rate=16000&channels=1"
-    f"&interim_results=true&vad=true&model=nova-3"
+DEEPGRAM_WS_URL = (
+    "wss://api.deepgram.com/v1/listen"
+    "?model=nova-3"
+    "&encoding=linear16"
+    "&sample_rate=16000"
+    "&channels=1"
+    "&interim_results=true"
+    "&vad_events=true"
+    "&endpointing=300"
+    "&smart_format=true"
+    "&punctuate=true"
 )
 
 app = FastAPI()
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -34,88 +40,145 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-logger.info("✓ FastAPI app initialized")
 
-async def safe_send_json(websocket: WebSocket, data: dict):
+async def send_frontend(websocket: WebSocket, payload: dict):
     try:
-        await websocket.send_json(data)
+        await websocket.send_json(payload)
     except Exception as e:
-        logger.error(f"Failed to send JSON to frontend: {e}")
+        logger.warning(f"Failed sending to frontend: {e}")
 
-@app.websocket("/ws/transcribe")
-async def websocket_transcribe(websocket: WebSocket):
-    logger.info(f"🔌 New WebSocket connection from {websocket.client}")
-    await websocket.accept()
-
-    dg_ws = None
-    deepgram_listener_task = None
-
+async def deepgram_keepalive(dg_ws):
     try:
-        logger.info("⏳ Connecting to Deepgram...")
-        dg_ws = await websockets.connect(DEEPGRAM_URL)
-        logger.info("✅ Connected to Deepgram")
-
-        async def forward_transcripts():
-            try:
-                async for message in dg_ws:
-                    if isinstance(message, str):
-                        try:
-                            data = json.loads(message)
-                            logger.info(f"📨 Deepgram message: {json.dumps(data)[:200]}")
-                            if data.get("type") == "Error":
-                                logger.error(f"❌ Deepgram error: {data.get('description', 'No description')}")
-                                await safe_send_json(websocket, {"type": "error", "message": data})
-                                continue
-                            transcript = data.get("channel", {}).get("alternatives", [{}])[0].get("transcript")
-                            if transcript:
-                                is_final = data.get("is_final", False)
-                                logger.info(f"📝 Transcript: '{transcript}' (final: {is_final})")
-                                await safe_send_json(websocket, {"type": "transcript", "text": transcript, "final": is_final})
-                        except json.JSONDecodeError:
-                            logger.warning(f"Non-JSON message from Deepgram: {message[:200]}")
-            except websockets.exceptions.ConnectionClosed as e:
-                logger.warning(f"Deepgram WebSocket closed: code={e.code}, reason={e.reason}")
-            except Exception as e:
-                logger.error(f"Error in forward_transcripts: {e}", exc_info=True)
-
-        deepgram_listener_task = asyncio.create_task(forward_transcripts())
-
         while True:
-            raw = await websocket.receive_text()
-            msg = json.loads(raw)
-            if msg.get("type") == "audio":
-                audio_bytes = base64.b64decode(msg["data"])
-                # Log first few sample values to detect silence
-                sample_count = min(len(audio_bytes) // 2, 10)
-                samples = []
-                for i in range(sample_count):
-                    sample = int.from_bytes(audio_bytes[i*2:(i+1)*2], 'little', signed=True)
-                    samples.append(sample)
-                logger.info(f"🎤 Received {len(audio_bytes)} bytes, first {sample_count} samples: {samples}")
-                await dg_ws.send(audio_bytes)
-                logger.info(f"✅ Sent audio chunk to Deepgram ({len(audio_bytes)} bytes)")
-            elif msg.get("type") == "stop":
-                logger.info("🛑 Stop signal received from frontend")
-                break
-
-    except WebSocketDisconnect:
-        logger.info("⚠️ Frontend WebSocket disconnected")
+            await asyncio.sleep(8)
+            await dg_ws.send(json.dumps({"type": "KeepAlive"}))
+    except asyncio.CancelledError:
+        pass
     except Exception as e:
-        logger.error(f"🔥 Unexpected error: {e}", exc_info=True)
-    finally:
-        if deepgram_listener_task:
-            deepgram_listener_task.cancel()
-        if dg_ws:
-            await dg_ws.close()
-            logger.info("🔒 Closed Deepgram WebSocket")
-        await websocket.close()
-        logger.info("🔒 Closed frontend WebSocket")
+        logger.warning(f"KeepAlive stopped: {e}")
 
 @app.get("/health")
 async def health():
     return {"status": "ok", "deepgram_configured": bool(DEEPGRAM_API_KEY)}
 
+@app.websocket("/ws/transcribe")
+async def websocket_transcribe(websocket: WebSocket):
+    await websocket.accept()
+    logger.info(f"Frontend connected: {websocket.client}")
+
+    dg_ws = None
+    dg_listener_task = None
+    dg_keepalive_task = None
+
+    try:
+        dg_ws = await websockets.connect(
+            DEEPGRAM_WS_URL,
+            additional_headers={
+                "Authorization": f"Token {DEEPGRAM_API_KEY}"
+            }
+        )
+        logger.info("Connected to Deepgram")
+
+        async def read_deepgram():
+            try:
+                async for message in dg_ws:
+                    if isinstance(message, bytes):
+                        continue
+
+                    data = json.loads(message)
+                    logger.info(f"Deepgram event: {json.dumps(data)[:500]}")
+
+                    msg_type = data.get("type")
+
+                    if msg_type == "Results":
+                        channel = data.get("channel", {})
+                        alternatives = channel.get("alternatives", [])
+                        transcript = alternatives[0].get("transcript", "") if alternatives else ""
+
+                        if transcript:
+                            await send_frontend(
+                                websocket,
+                                {
+                                    "type": "transcript",
+                                    "text": transcript,
+                                    "final": data.get("is_final", False),
+                                    "speech_final": data.get("speech_final", False),
+                                },
+                            )
+
+                    elif msg_type == "Metadata":
+                        await send_frontend(
+                            websocket,
+                            {
+                                "type": "metadata",
+                                "request_id": data.get("request_id"),
+                                "duration": data.get("duration"),
+                            },
+                        )
+
+                    elif msg_type == "UtteranceEnd":
+                        await send_frontend(websocket, {"type": "utterance_end"})
+
+                    elif msg_type == "SpeechStarted":
+                        await send_frontend(websocket, {"type": "speech_started"})
+
+                    elif msg_type == "Error":
+                        await send_frontend(
+                            websocket,
+                            {"type": "error", "message": data}
+                        )
+
+            except asyncio.CancelledError:
+                pass
+            except Exception as e:
+                logger.exception(f"Error reading Deepgram messages: {e}")
+                await send_frontend(websocket, {"type": "error", "message": str(e)})
+
+        dg_listener_task = asyncio.create_task(read_deepgram())
+        dg_keepalive_task = asyncio.create_task(deepgram_keepalive(dg_ws))
+
+        while True:
+            raw = await websocket.receive_text()
+            msg = json.loads(raw)
+
+            if msg.get("type") == "audio":
+                audio_bytes = base64.b64decode(msg["data"])
+                await dg_ws.send(audio_bytes)
+
+            elif msg.get("type") == "stop":
+                await dg_ws.send(json.dumps({"type": "CloseStream"}))
+                break
+
+    except WebSocketDisconnect:
+        logger.info("Frontend disconnected")
+
+    except Exception as e:
+        logger.exception(f"Unexpected server error: {e}")
+        try:
+            await send_frontend(websocket, {"type": "error", "message": str(e)})
+        except Exception:
+            pass
+
+    finally:
+        if dg_keepalive_task:
+            dg_keepalive_task.cancel()
+
+        if dg_listener_task:
+            dg_listener_task.cancel()
+
+        if dg_ws:
+            try:
+                await dg_ws.close()
+            except Exception:
+                pass
+
+        try:
+            await websocket.close()
+        except Exception:
+            pass
+
+        logger.info("Connections closed")
+
 if __name__ == "__main__":
-    logger.info("🚀 Starting server...")
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)
