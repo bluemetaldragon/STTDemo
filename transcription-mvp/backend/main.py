@@ -25,10 +25,8 @@ DEEPGRAM_WS_URL = (
     "&sample_rate=16000"
     "&channels=1"
     "&interim_results=true"
-    "&vad_events=true"
-    "&endpointing=300"
     "&smart_format=true"
-    "&punctuate=true"
+    "&endpointing=false"
 )
 
 app = FastAPI()
