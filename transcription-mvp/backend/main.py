@@ -61,7 +61,7 @@ async def websocket_transcribe(websocket: WebSocket):
         # Connect to Deepgram
         dg_ws = await websockets.connect(
             DEEPGRAM_WS_URL,
-            additional_headers={"Authorization": f"Token {DEEPGRAM_API_KEY}"}
+            extra_headers={"Authorization": f"Token {DEEPGRAM_API_KEY}"}
         )
         logger.info("Connected to Deepgram")
 
