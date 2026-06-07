@@ -73,7 +73,7 @@ async def websocket_transcribe(websocket: WebSocket):
     try:
         dg_ws = await websockets.connect(
             DEEPGRAM_WS_URL,
-            additional_headers={
+            extra_headers={
                 "Authorization": f"Token {DEEPGRAM_API_KEY}"
             }
         )
