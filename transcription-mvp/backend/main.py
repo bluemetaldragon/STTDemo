@@ -25,8 +25,10 @@ DEEPGRAM_WS_URL = (
     "&sample_rate=16000"
     "&channels=1"
     "&interim_results=true"
+    "&vad_events=true"
+    "&endpointing=300"
     "&smart_format=true"
-    "&endpointing=false"
+    "&punctuate=true"
 )
 
 app = FastAPI()
@@ -71,7 +73,7 @@ async def websocket_transcribe(websocket: WebSocket):
     try:
         dg_ws = await websockets.connect(
             DEEPGRAM_WS_URL,
-            extra_headers={
+            additional_headers={
                 "Authorization": f"Token {DEEPGRAM_API_KEY}"
             }
         )
@@ -139,31 +141,9 @@ async def websocket_transcribe(websocket: WebSocket):
             raw = await websocket.receive_text()
             msg = json.loads(raw)
 
-            # change start
             if msg.get("type") == "audio":
                 audio_bytes = base64.b64decode(msg["data"])
-                sample_count = len(audio_bytes) // 2
-
-                if sample_count > 0:
-                    inspect_n = min(sample_count, 400)
-                    samples = [
-                        int.from_bytes(audio_bytes[i*2:(i+1)*2], "little", signed=True)
-                        for i in range(inspect_n)
-                    ]
-                    abs_avg = sum(abs(s) for s in samples) / len(samples)
-                    zero_pct = 100.0 * sum(1 for s in samples if s == 0) / len(samples)
-
-                    logger.info(
-                        f"audio chunk bytes={len(audio_bytes)} "
-                        f"samples={sample_count} "
-                        f"min={min(samples)} max={max(samples)} "
-                        f"abs_avg={abs_avg:.1f} zero_pct={zero_pct:.1f} "
-                        f"first8={samples[:8]}"
-                    )
-
                 await dg_ws.send(audio_bytes)
-            # change end
-
 
             elif msg.get("type") == "stop":
                 await dg_ws.send(json.dumps({"type": "CloseStream"}))
