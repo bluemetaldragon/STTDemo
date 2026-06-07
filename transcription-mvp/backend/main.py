@@ -3,7 +3,6 @@ import json
 import logging
 import os
 from contextlib import suppress
-from typing import Optional
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
@@ -18,7 +17,7 @@ logger = logging.getLogger("transcription-backend")
 
 DEEPGRAM_API_KEY = os.getenv("DEEPGRAM_API_KEY")
 if not DEEPGRAM_API_KEY:
-    raise RuntimeError("DEEPGRAM_API_KEY is not set")
+    raise RuntimeError("DEEPGRAM_API_KEY environment variable is not set")
 
 app = FastAPI()
 
@@ -41,9 +40,7 @@ async def websocket_transcribe(websocket: WebSocket):
     await websocket.accept()
     logger.info(f"Frontend connected: {websocket.client}")
 
-    deepgram: Optional[DeepgramClient] = None
-    dg_connection = None
-    closed = False
+    client = DeepgramClient()
     frontend_closed = False
 
     async def send_json_safe(payload: dict):
@@ -55,114 +52,97 @@ async def websocket_transcribe(websocket: WebSocket):
         except Exception:
             frontend_closed = True
 
-    async def close_everything():
-        nonlocal closed, frontend_closed, dg_connection
-        if closed:
-            return
-        closed = True
-
-        if dg_connection is not None:
-            with suppress(Exception):
-                finish_result = dg_connection.finish()
-                if asyncio.iscoroutine(finish_result):
-                    await finish_result
-
-        if not frontend_closed:
-            with suppress(Exception):
-                await websocket.close()
-            frontend_closed = True
-
     try:
-        deepgram = DeepgramClient(DEEPGRAM_API_KEY)
-        dg_connection = deepgram.listen.websocket.v("1")
+        # Using the documented context manager pattern for WebSocket connections
+        # Reference: https://deepwiki.com/deepgram/deepgram-python-sdk/3.2-websocket-api-for-tts
+        with client.listen.v2.connect(
+            model="nova-3",
+            encoding="linear16",
+            sample_rate=16000,
+            language="en-US",
+            interim_results=True,
+            punctuate=True,
+            smart_format=True,
+            endpointing=300,
+            vad_events=True,
+        ) as connection:
+            # Register event callbacks as documented
+            # Reference: https://github.com/deepgram/deepgram-python-sdk
+            def on_open(open_event):
+                logger.info("Deepgram connection opened")
+                asyncio.create_task(
+                    send_json_safe({"type": "deepgram_ready"})
+                )
 
-        async def handle_open(*args, **kwargs):
-            logger.info("Deepgram connection opened")
-            await send_json_safe({"type": "deepgram_ready"})
-
-        async def handle_transcript(result, *args, **kwargs):
-            try:
-                channel = getattr(result, "channel", None)
-                alternatives = getattr(channel, "alternatives", None) if channel else None
-                transcript = ""
-
-                if alternatives and len(alternatives) > 0:
-                    transcript = getattr(alternatives[0], "transcript", "") or ""
-
-                if transcript:
-                    await send_json_safe(
-                        {
-                            "type": "transcript",
-                            "text": transcript,
-                            "final": bool(getattr(result, "is_final", False)),
-                            "speech_final": bool(getattr(result, "speech_final", False)),
-                        }
-                    )
-            except Exception as e:
-                logger.exception("Transcript handler failed")
-                await send_json_safe({"type": "error", "message": f"Transcript handler error: {str(e)}"})
-
-        async def handle_error(error, *args, **kwargs):
-            logger.exception("Deepgram error: %s", error)
-            await send_json_safe({"type": "error", "message": str(error)})
-
-        async def handle_close(*args, **kwargs):
-            logger.info("Deepgram connection closed")
-
-        dg_connection.on(EventType.OPEN, handle_open)
-        dg_connection.on(EventType.MESSAGE, handle_transcript)   # Note: MESSAGE, not TRANSCRIPT
-        dg_connection.on(EventType.ERROR, handle_error)
-        dg_connection.on(EventType.CLOSE, handle_close)
-
-        options = {
-            "model": "nova-3",
-            "language": "en-US",
-            "encoding": "linear16",
-            "sample_rate": 16000,
-            "channels": 1,
-            "interim_results": True,
-            "smart_format": True,
-            "punctuate": True,
-            "endpointing": 300,
-        }
-
-        start_result = dg_connection.start(options)
-        if asyncio.iscoroutine(start_result):
-            await start_result
-
-        # Main loop: receive binary audio or text control messages
-        while True:
-            message = await websocket.receive()
-
-            if "bytes" in message and message["bytes"] is not None:
-                audio_chunk = message["bytes"]
-                if audio_chunk:
-                    send_result = dg_connection.send(audio_chunk)
-                    if asyncio.iscoroutine(send_result):
-                        await send_result
-
-            elif "text" in message and message["text"] is not None:
-                raw_text = message["text"]
+            def on_message(message):
                 try:
-                    payload = json.loads(raw_text)
-                except json.JSONDecodeError:
-                    await send_json_safe(
-                        {"type": "error", "message": "Invalid JSON text message received from frontend"}
-                    )
-                    continue
+                    # Extract transcript from the message object
+                    # Reference: Listen examples show accessing results via message
+                    if hasattr(message, "channel"):
+                        alternatives = message.channel.alternatives
+                        if alternatives and alternatives[0].transcript:
+                            transcript_text = alternatives[0].transcript
+                            asyncio.create_task(
+                                send_json_safe(
+                                    {
+                                        "type": "transcript",
+                                        "text": transcript_text,
+                                        "final": getattr(message, "is_final", False),
+                                        "speech_final": getattr(message, "speech_final", False),
+                                    }
+                                )
+                            )
+                except Exception as e:
+                    logger.error(f"Transcript handler error: {e}")
 
-                if payload.get("type") == "stop":
-                    logger.info("Stop command received")
-                    await close_everything()
+            def on_error(error):
+                logger.error(f"Deepgram error: {error}")
+                asyncio.create_task(
+                    send_json_safe({"type": "error", "message": str(error)})
+                )
+
+            def on_close(close_event):
+                logger.info("Deepgram connection closed")
+
+            connection.on(EventType.OPEN, on_open)
+            connection.on(EventType.MESSAGE, on_message)
+            connection.on(EventType.ERROR, on_error)
+            connection.on(EventType.CLOSE, on_close)
+
+            # Start listening as documented
+            # Reference: start_listening() initiates the receive loop
+            connection.start_listening()
+
+            # Main loop: receive binary audio or text control messages
+            while True:
+                message = await websocket.receive()
+
+                if "bytes" in message and message["bytes"] is not None:
+                    audio_chunk = message["bytes"]
+                    if audio_chunk:
+                        # Send audio via documented send_media method
+                        # Reference: V1SocketClient send_media(bytes) method
+                        connection.send_media(audio_chunk)
+
+                elif "text" in message and message["text"] is not None:
+                    raw_text = message["text"]
+                    try:
+                        payload = json.loads(raw_text)
+                    except json.JSONDecodeError:
+                        await send_json_safe(
+                            {"type": "error", "message": "Invalid JSON text message"}
+                        )
+                        continue
+
+                    if payload.get("type") == "stop":
+                        logger.info("Stop command received, closing connection")
+                        break
+
+                elif message.get("type") == "websocket.disconnect":
                     break
-
-            elif message.get("type") == "websocket.disconnect":
-                break
 
     except WebSocketDisconnect:
         logger.info("Frontend WebSocket disconnected")
     except Exception as e:
         logger.exception("Backend error")
         await send_json_safe({"type": "error", "message": str(e)})
-    finally:
-        await close_everything()
