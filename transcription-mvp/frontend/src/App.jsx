@@ -141,7 +141,7 @@ function useAudioCapture(onAudioChunk) {
 }
 
 export default function TranscriptionApp() {
-  const serverUrl = window.location.hostname === 'localhost' ? 'http://localhost:8000' : 'https://your-prod-url.com';
+  const serverUrl = window.location.hostname === 'localhost' ? 'http://localhost:8000' : 'https://sttdemo-production.up.railway.app';
 
   const {
     finalTranscript,
