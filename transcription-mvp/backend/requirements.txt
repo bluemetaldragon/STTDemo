@@ -2,6 +2,6 @@ fastapi>=0.115.0
 uvicorn>=0.24.0
 websockets>=12.0
 python-dotenv>=1.0.0
-deepgram-sdk>=6.0.0
+deepgram-sdk>=7.0.0
 pydantic>=2.7.0
 python-multipart>=0.0.6
