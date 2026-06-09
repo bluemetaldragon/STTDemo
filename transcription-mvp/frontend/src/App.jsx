@@ -253,7 +253,7 @@ export default function TranscriptionApp() {
   };
   const serverUrl = getServerUrl();
 
-  const { transcript, error, connect, disconnect, sendAudioChunk, isConnected, wsLogs, setTranscript } =
+  const { transcript, error, connect, disconnect, sendAudioChunk, isConnected, wsLogs, resetTranscript } =
     useWebSocketTranscript(serverUrl);
   const { isRecording, startRecording, stopRecording, debugLogs } = useAudioCapture(sendAudioChunk);
   const [isBusy, setIsBusy] = useState(false);
@@ -268,10 +268,12 @@ export default function TranscriptionApp() {
     if (isRecording || isBusy) return;
     setIsBusy(true);
     try {
-      resetTranscript();        // <-- clear old transcript
+      resetTranscript();   // clear old transcript
       await connect();
-      await startRecording();
+      const ok = await startRecording();
+      if (!ok) disconnect();
     } catch (e) {
+      console.error(e);
       disconnect();
     } finally {
       setIsBusy(false);
