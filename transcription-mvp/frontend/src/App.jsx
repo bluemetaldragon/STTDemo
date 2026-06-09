@@ -3,7 +3,8 @@ import React, { useState, useRef, useEffect, useCallback } from 'react';
 // ---------- WebSocket hook with binary audio ----------
 function useWebSocketTranscript(serverUrl) {
   const [wsStatus, setWsStatus] = useState('idle');
-  const [transcript, setTranscript] = useState('');
+  const [finalTranscript, setFinalTranscript] = useState('');
+  const [interimTranscript, setInterimTranscript] = useState('');
   const [error, setError] = useState(null);
   const [wsLogs, setWsLogs] = useState([]);
   const wsRef = useRef(null);
@@ -31,34 +32,36 @@ function useWebSocketTranscript(serverUrl) {
         const wsUrl = serverUrl.replace(/^http/, 'ws') + '/ws/transcribe';
         addWsLog(`Connecting to ${wsUrl}`);
         const ws = new WebSocket(wsUrl);
-        ws.binaryType = 'arraybuffer'; // important for binary audio
+        ws.binaryType = 'arraybuffer';
         wsRef.current = ws;
         manualCloseRef.current = false;
+        let pingInterval = null;
 
         ws.onopen = () => {
           addWsLog('✓ WebSocket connected');
           setWsStatus('connected');
           reconnectAttemptsRef.current = 0;
           resolve(ws);
+          // Send a ping every 5 seconds to keep the connection alive (optional)
+          pingInterval = setInterval(() => {
+            if (ws.readyState === WebSocket.OPEN) {
+              ws.send(JSON.stringify({ type: 'ping' }));
+            }
+          }, 5000);
         };
 
-        // Add two new state variables inside useWebSocketTranscript
-        const [finalTranscript, setFinalTranscript] = useState('');
-        const [interimTranscript, setInterimTranscript] = useState('');
-
-        // ... inside ws.onmessage:
         ws.onmessage = (event) => {
           if (typeof event.data === 'string') {
             try {
               const msg = JSON.parse(event.data);
               if (msg.type === 'transcript' && msg.text) {
                 addWsLog(`📝 Transcript: "${msg.text}" ${msg.final ? '(final)' : '(interim)'}`);
-                if (msg.final) {
+                if (msg.final === true) {
                   // Final: append to permanent transcript and clear interim
                   setFinalTranscript(prev => prev + (prev ? ' ' : '') + msg.text);
                   setInterimTranscript('');
                 } else {
-                  // Interim: replace the current interim text
+                  // Interim: replace the temporary transcript
                   setInterimTranscript(msg.text);
                 }
               } else if (msg.type === 'error') {
@@ -77,8 +80,6 @@ function useWebSocketTranscript(serverUrl) {
           }
         };
 
-// Combine for display (return this instead of plain transcript)
-const displayTranscript = finalTranscript + (interimTranscript ? ' ' + interimTranscript : '');
         ws.onerror = () => {
           addWsLog('❌ WebSocket error');
           setWsStatus('error');
@@ -86,6 +87,7 @@ const displayTranscript = finalTranscript + (interimTranscript ? ' ' + interimTr
         };
 
         ws.onclose = (event) => {
+          if (pingInterval) clearInterval(pingInterval);
           addWsLog(`❌ Closed (code=${event.code})`);
           wsRef.current = null;
           setWsStatus('idle');
@@ -105,7 +107,6 @@ const displayTranscript = finalTranscript + (interimTranscript ? ' ' + interimTr
     });
   }, [serverUrl, addWsLog, clearReconnectTimer]);
 
-  // Send raw binary audio (ArrayBuffer)
   const sendAudioChunk = useCallback((arrayBuffer) => {
     const ws = wsRef.current;
     if (!ws || ws.readyState !== WebSocket.OPEN) return false;
@@ -128,6 +129,11 @@ const displayTranscript = finalTranscript + (interimTranscript ? ' ' + interimTr
     setWsStatus('idle');
   }, [clearReconnectTimer]);
 
+  const resetTranscript = useCallback(() => {
+    setFinalTranscript('');
+    setInterimTranscript('');
+  }, []);
+
   useEffect(() => {
     return () => {
       manualCloseRef.current = true;
@@ -136,8 +142,22 @@ const displayTranscript = finalTranscript + (interimTranscript ? ' ' + interimTr
     };
   }, [clearReconnectTimer]);
 
-  return { wsStatus, transcript: displayTranscript, error, wsLogs, connect, disconnect, sendAudioChunk, isConnected: wsStatus === 'connected', setTranscript: setFinalTranscript };
+  // Combine final and interim for display
+  const displayTranscript = finalTranscript + (interimTranscript ? ' ' + interimTranscript : '');
+
+  return {
+    wsStatus,
+    transcript: displayTranscript,
+    error,
+    wsLogs,
+    connect,
+    disconnect,
+    sendAudioChunk,
+    isConnected: wsStatus === 'connected',
+    resetTranscript,
+  };
 }
+
 
 // ---------- Audio capture (unchanged, but passes raw ArrayBuffer) ----------
 function useAudioCapture(onAudioChunk) {
