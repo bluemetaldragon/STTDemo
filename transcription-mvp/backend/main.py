@@ -33,6 +33,38 @@ app.add_middleware(
 async def health():
     return {"status": "ok", "deepgram_configured": bool(DEEPGRAM_API_KEY)}
 
+
+def extract_transcript(message) -> str:
+    """Safely extract transcript from Deepgram v1 message object."""
+    try:
+        if hasattr(message, "channel"):
+            channel = message.channel
+            if hasattr(channel, "alternatives"):
+                alt = channel.alternatives
+                if alt and len(alt) > 0:
+                    return alt[0].transcript or ""
+            elif isinstance(channel, list) and len(channel) > 0:
+                for ch in channel:
+                    if hasattr(ch, "alternatives"):
+                        alt = ch.alternatives
+                        if alt and len(alt) > 0 and alt[0].transcript:
+                            return alt[0].transcript
+        elif hasattr(message, "results"):
+            results = message.results
+            if hasattr(results, "channels"):
+                channels = results.channels
+                if channels and len(channels) > 0:
+                    alt = channels[0].alternatives
+                    if alt and len(alt) > 0:
+                        return alt[0].transcript or ""
+        elif hasattr(message, "transcript"):
+            return message.transcript
+        return None
+    except Exception as e:
+        logger.error(f"Error extracting transcript: {e}")
+        return None
+
+
 @app.websocket("/ws/transcribe")
 async def websocket_transcribe(websocket: WebSocket):
     await websocket.accept()
@@ -41,6 +73,7 @@ async def websocket_transcribe(websocket: WebSocket):
     client = DeepgramClient(api_key=DEEPGRAM_API_KEY)
     frontend_closed = False
     main_loop = asyncio.get_running_loop()
+    stop_keepalive = threading.Event()
 
     async def send_json_safe(payload: dict):
         nonlocal frontend_closed
@@ -60,24 +93,24 @@ async def websocket_transcribe(websocket: WebSocket):
 
     def on_message(message):
         try:
-            if hasattr(message, "channel"):
-                alternatives = message.channel.alternatives
-                if alternatives and alternatives[0].transcript:
-                    transcript_text = alternatives[0].transcript
-                    is_final = getattr(message, "is_final", False)
-                    speech_final = getattr(message, "speech_final", False)
-                    logger.info(f"📝 Transcript: '{transcript_text}' (final: {is_final})")
-                    asyncio.run_coroutine_threadsafe(
-                        send_json_safe({
-                            "type": "transcript",
-                            "text": transcript_text,
-                            "final": is_final,
-                            "speech_final": speech_final,
-                        }),
-                        main_loop
-                    )
+            transcript = extract_transcript(message)
+            if transcript:
+                is_final = getattr(message, "is_final", False)
+                speech_final = getattr(message, "speech_final", False)
+                logger.info(f"📝 Transcript: '{transcript}' (final: {is_final})")
+                asyncio.run_coroutine_threadsafe(
+                    send_json_safe({
+                        "type": "transcript",
+                        "text": transcript,
+                        "final": is_final,
+                        "speech_final": speech_final,
+                    }),
+                    main_loop
+                )
+            else:
+                logger.debug(f"No transcript in message: {type(message)}")
         except Exception as e:
-            logger.error(f"Transcript handler error: {e}")
+            logger.error(f"Transcript handler error: {e}", exc_info=True)
 
     def on_error(error):
         logger.error(f"❌ Deepgram error: {error}")
@@ -89,7 +122,7 @@ async def websocket_transcribe(websocket: WebSocket):
     def on_close(_):
         logger.info("Deepgram connection closed")
 
-    # Create Deepgram v1 connection inside context manager
+    # Deepgram connection – your original parameters (no changes)
     with client.listen.v1.connect(
         model="nova-3",
         encoding="linear16",
@@ -98,7 +131,7 @@ async def websocket_transcribe(websocket: WebSocket):
         interim_results=True,
         punctuate=True,
         smart_format=True,
-        endpointing=300,
+        endpointing=300,          # unchanged
         vad_events=True,
     ) as connection:
         connection.on(EventType.OPEN, on_open)
@@ -106,46 +139,48 @@ async def websocket_transcribe(websocket: WebSocket):
         connection.on(EventType.ERROR, on_error)
         connection.on(EventType.CLOSE, on_close)
 
-        # Start Deepgram listener in a background thread (non‑blocking)
-        threading.Thread(target=connection.start_listening, daemon=True).start()
+        # ---- IMPROVED KEEPALIVE ----
+        # Deepgram recommends sending a newline character every few seconds
+        # to prevent the connection from timing out.
+        def keepalive_loop():
+            while not stop_keepalive.is_set():
+                if stop_keepalive.wait(5):
+                    return
+                try:
+                    # Send a simple newline – this keeps the connection alive
+                    # without affecting the audio stream.
+                    connection.send("\n")
+                    logger.debug("Sent keep‑alive (newline) to Deepgram")
+                except Exception as e:
+                    logger.warning(f"Keep‑alive failed: {e}")
+                    return
+
+        keepalive_thread = threading.Thread(target=keepalive_loop, daemon=True)
+        keepalive_thread.start()
+
+        # Start Deepgram listening thread
+        listener_thread = threading.Thread(target=connection.start_listening, daemon=True)
+        listener_thread.start()
 
         try:
             while True:
-                # Receive any WebSocket message (binary or text)
                 msg = await websocket.receive()
-
-                # ----- Binary frame: audio data -----
                 if "bytes" in msg:
                     audio_bytes = msg["bytes"]
-                    logger.info(f"🎤 Received binary audio chunk: {len(audio_bytes)} bytes")
-
-                    # Log first few samples to verify it's not silence
-                    sample_count = min(len(audio_bytes) // 2, 10)
-                    samples = []
-                    for i in range(sample_count):
-                        sample = int.from_bytes(audio_bytes[i*2:(i+1)*2], 'little', signed=True)
-                        samples.append(sample)
-                    logger.info(f"First {sample_count} samples: {samples}")
-
+                    logger.info(f"🎤 Received binary chunk: {len(audio_bytes)} bytes")
                     connection.send_media(audio_bytes)
-
-                # ----- Text frame: JSON control messages -----
                 elif "text" in msg:
                     try:
                         payload = json.loads(msg["text"])
+                        if payload.get("type") == "stop":
+                            logger.info("Stop command received")
+                            break
+                        else:
+                            logger.warning(f"Unknown text message: {payload}")
                     except json.JSONDecodeError as e:
                         logger.error(f"Invalid JSON: {e}")
-                        continue
-
-                    if payload.get("type") == "stop":
-                        logger.info("Stop command received")
-                        break
-                    else:
-                        logger.warning(f"Unknown text message: {payload}")
-
                 else:
-                    logger.warning(f"Unexpected message structure: {msg.keys()}")
-
+                    logger.warning(f"Unexpected message: {msg.keys()}")
         except WebSocketDisconnect:
             logger.info("Frontend WebSocket disconnected")
             frontend_closed = True
@@ -153,7 +188,7 @@ async def websocket_transcribe(websocket: WebSocket):
             logger.exception("Backend error")
             await send_json_safe({"type": "error", "message": str(e)})
         finally:
-            # Gracefully close Deepgram stream
+            stop_keepalive.set()
             try:
                 connection.send_finalize()
                 connection.send_close_stream()
