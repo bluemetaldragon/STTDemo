@@ -17,7 +17,10 @@ logger = logging.getLogger("transcription-backend")
 
 DEEPGRAM_API_KEY = os.getenv("DEEPGRAM_API_KEY")
 if not DEEPGRAM_API_KEY:
+    logger.error("❌ DEEPGRAM_API_KEY environment variable is not set!")
     raise RuntimeError("DEEPGRAM_API_KEY environment variable is not set")
+else:
+    logger.info(f"✓ API key loaded: {DEEPGRAM_API_KEY[:5]}... (length {len(DEEPGRAM_API_KEY)})")
 
 app = FastAPI()
 
@@ -40,7 +43,8 @@ async def websocket_transcribe(websocket: WebSocket):
     await websocket.accept()
     logger.info(f"Frontend connected: {websocket.client}")
 
-    client = DeepgramClient()
+    # Pass the API key explicitly
+    client = DeepgramClient(api_key=DEEPGRAM_API_KEY)
     frontend_closed = False
 
     async def send_json_safe(payload: dict):
@@ -54,7 +58,6 @@ async def websocket_transcribe(websocket: WebSocket):
 
     try:
         # Using the documented context manager pattern for WebSocket connections
-        # Reference: https://deepwiki.com/deepgram/deepgram-python-sdk/3.2-websocket-api-for-tts
         with client.listen.v2.connect(
             model="nova-3",
             encoding="linear16",
@@ -66,22 +69,19 @@ async def websocket_transcribe(websocket: WebSocket):
             endpointing=300,
             vad_events=True,
         ) as connection:
-            # Register event callbacks as documented
-            # Reference: https://github.com/deepgram/deepgram-python-sdk
             def on_open(open_event):
-                logger.info("Deepgram connection opened")
-                asyncio.create_task(
-                    send_json_safe({"type": "deepgram_ready"})
-                )
+                logger.info("✅ Deepgram connection opened")
+                asyncio.create_task(send_json_safe({"type": "deepgram_ready"}))
 
             def on_message(message):
                 try:
-                    # Extract transcript from the message object
-                    # Reference: Listen examples show accessing results via message
+                    # Log the raw message for debugging
+                    logger.info(f"📨 Deepgram message received: {message}")
                     if hasattr(message, "channel"):
                         alternatives = message.channel.alternatives
                         if alternatives and alternatives[0].transcript:
                             transcript_text = alternatives[0].transcript
+                            logger.info(f"📝 Transcript: '{transcript_text}'")
                             asyncio.create_task(
                                 send_json_safe(
                                     {
@@ -96,7 +96,7 @@ async def websocket_transcribe(websocket: WebSocket):
                     logger.error(f"Transcript handler error: {e}")
 
             def on_error(error):
-                logger.error(f"Deepgram error: {error}")
+                logger.error(f"❌ Deepgram error: {error}")
                 asyncio.create_task(
                     send_json_safe({"type": "error", "message": str(error)})
                 )
@@ -109,8 +109,6 @@ async def websocket_transcribe(websocket: WebSocket):
             connection.on(EventType.ERROR, on_error)
             connection.on(EventType.CLOSE, on_close)
 
-            # Start listening as documented
-            # Reference: start_listening() initiates the receive loop
             connection.start_listening()
 
             # Main loop: receive binary audio or text control messages
@@ -120,8 +118,14 @@ async def websocket_transcribe(websocket: WebSocket):
                 if "bytes" in message and message["bytes"] is not None:
                     audio_chunk = message["bytes"]
                     if audio_chunk:
-                        # Send audio via documented send_media method
-                        # Reference: V1SocketClient send_media(bytes) method
+                        logger.info(f"🎤 Received audio chunk: {len(audio_chunk)} bytes")
+                        # Log first few sample values to detect silence
+                        sample_count = min(len(audio_chunk) // 2, 10)
+                        samples = []
+                        for i in range(sample_count):
+                            sample = int.from_bytes(audio_chunk[i*2:(i+1)*2], 'little', signed=True)
+                            samples.append(sample)
+                        logger.info(f"First {sample_count} samples: {samples}")
                         connection.send_media(audio_chunk)
 
                 elif "text" in message and message["text"] is not None:
@@ -129,9 +133,7 @@ async def websocket_transcribe(websocket: WebSocket):
                     try:
                         payload = json.loads(raw_text)
                     except json.JSONDecodeError:
-                        await send_json_safe(
-                            {"type": "error", "message": "Invalid JSON text message"}
-                        )
+                        await send_json_safe({"type": "error", "message": "Invalid JSON text message"})
                         continue
 
                     if payload.get("type") == "stop":
