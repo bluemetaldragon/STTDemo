@@ -1,6 +1,5 @@
 import asyncio
 import json
-import base64
 import logging
 import os
 import threading
@@ -22,7 +21,6 @@ if not DEEPGRAM_API_KEY:
 logger.info(f"✓ API key loaded: {DEEPGRAM_API_KEY[:5]}... (length {len(DEEPGRAM_API_KEY)})")
 
 app = FastAPI()
-
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -53,7 +51,7 @@ async def websocket_transcribe(websocket: WebSocket):
         except Exception:
             frontend_closed = True
 
-    def on_open(open_event):
+    def on_open(_):
         logger.info("✅ Deepgram connection opened")
         asyncio.run_coroutine_threadsafe(
             send_json_safe({"type": "deepgram_ready"}),
@@ -88,7 +86,7 @@ async def websocket_transcribe(websocket: WebSocket):
             main_loop
         )
 
-    def on_close(close_event):
+    def on_close(_):
         logger.info("Deepgram connection closed")
 
     # Create Deepgram v1 connection inside context manager
@@ -109,19 +107,19 @@ async def websocket_transcribe(websocket: WebSocket):
         connection.on(EventType.CLOSE, on_close)
 
         # Start Deepgram listener in a background thread (non‑blocking)
-        listener_thread = threading.Thread(target=connection.start_listening, daemon=True)
-        listener_thread.start()
+        threading.Thread(target=connection.start_listening, daemon=True).start()
 
         try:
             while True:
-                raw = await websocket.receive_text()
-                payload = json.loads(raw)
+                # Receive any WebSocket message (binary or text)
+                msg = await websocket.receive()
 
-                if payload.get("type") == "audio":
-                    audio_b64 = payload.get("data", "")
-                    audio_bytes = base64.b64decode(audio_b64)
-                    logger.info(f"🎤 Received audio chunk: {len(audio_bytes)} bytes")
+                # ----- Binary frame: audio data -----
+                if "bytes" in msg:
+                    audio_bytes = msg["bytes"]
+                    logger.info(f"🎤 Received binary audio chunk: {len(audio_bytes)} bytes")
 
+                    # Log first few samples to verify it's not silence
                     sample_count = min(len(audio_bytes) // 2, 10)
                     samples = []
                     for i in range(sample_count):
@@ -131,21 +129,31 @@ async def websocket_transcribe(websocket: WebSocket):
 
                     connection.send_media(audio_bytes)
 
-                elif payload.get("type") == "stop":
-                    logger.info("Stop command received")
-                    break
+                # ----- Text frame: JSON control messages -----
+                elif "text" in msg:
+                    try:
+                        payload = json.loads(msg["text"])
+                    except json.JSONDecodeError as e:
+                        logger.error(f"Invalid JSON: {e}")
+                        continue
+
+                    if payload.get("type") == "stop":
+                        logger.info("Stop command received")
+                        break
+                    else:
+                        logger.warning(f"Unknown text message: {payload}")
 
                 else:
-                    logger.warning(f"Unknown message type: {payload.get('type')}")
+                    logger.warning(f"Unexpected message structure: {msg.keys()}")
 
         except WebSocketDisconnect:
             logger.info("Frontend WebSocket disconnected")
-            frontend_closed = True   # Prevent further send attempts
+            frontend_closed = True
         except Exception as e:
             logger.exception("Backend error")
             await send_json_safe({"type": "error", "message": str(e)})
         finally:
-            # Gracefully close Deepgram stream even if frontend disconnected abruptly
+            # Gracefully close Deepgram stream
             try:
                 connection.send_finalize()
                 connection.send_close_stream()
