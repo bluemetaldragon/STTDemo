@@ -42,14 +42,25 @@ function useWebSocketTranscript(serverUrl) {
           resolve(ws);
         };
 
+        // Add two new state variables inside useWebSocketTranscript
+        const [finalTranscript, setFinalTranscript] = useState('');
+        const [interimTranscript, setInterimTranscript] = useState('');
+
+        // ... inside ws.onmessage:
         ws.onmessage = (event) => {
-          // Only text messages (JSON) contain transcript/control data
           if (typeof event.data === 'string') {
             try {
               const msg = JSON.parse(event.data);
               if (msg.type === 'transcript' && msg.text) {
                 addWsLog(`📝 Transcript: "${msg.text}" ${msg.final ? '(final)' : '(interim)'}`);
-                setTranscript(prev => prev + (prev ? ' ' : '') + msg.text);
+                if (msg.final) {
+                  // Final: append to permanent transcript and clear interim
+                  setFinalTranscript(prev => prev + (prev ? ' ' : '') + msg.text);
+                  setInterimTranscript('');
+                } else {
+                  // Interim: replace the current interim text
+                  setInterimTranscript(msg.text);
+                }
               } else if (msg.type === 'error') {
                 addWsLog(`❌ Error: ${msg.message}`);
                 setError(msg.message);
@@ -64,9 +75,10 @@ function useWebSocketTranscript(serverUrl) {
               addWsLog(`❌ Parse error: ${e.message}`);
             }
           }
-          // Binary messages (audio) are ignored – they are only sent to backend
         };
 
+// Combine for display (return this instead of plain transcript)
+const displayTranscript = finalTranscript + (interimTranscript ? ' ' + interimTranscript : '');
         ws.onerror = () => {
           addWsLog('❌ WebSocket error');
           setWsStatus('error');
@@ -124,7 +136,7 @@ function useWebSocketTranscript(serverUrl) {
     };
   }, [clearReconnectTimer]);
 
-  return { wsStatus, transcript, error, wsLogs, connect, disconnect, sendAudioChunk, isConnected: wsStatus === 'connected', setTranscript };
+  return { wsStatus, transcript: displayTranscript, error, wsLogs, connect, disconnect, sendAudioChunk, isConnected: wsStatus === 'connected', setTranscript: setFinalTranscript };
 }
 
 // ---------- Audio capture (unchanged, but passes raw ArrayBuffer) ----------
