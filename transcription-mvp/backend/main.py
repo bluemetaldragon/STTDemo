@@ -42,8 +42,6 @@ async def websocket_transcribe(websocket: WebSocket):
 
     client = DeepgramClient(api_key=DEEPGRAM_API_KEY)
     frontend_closed = False
-
-    # Capture the main event loop for thread‑safe callbacks
     main_loop = asyncio.get_running_loop()
 
     async def send_json_safe(payload: dict):
@@ -55,7 +53,6 @@ async def websocket_transcribe(websocket: WebSocket):
         except Exception:
             frontend_closed = True
 
-    # Define callbacks (will run in background thread)
     def on_open(open_event):
         logger.info("✅ Deepgram connection opened")
         asyncio.run_coroutine_threadsafe(
@@ -94,8 +91,8 @@ async def websocket_transcribe(websocket: WebSocket):
     def on_close(close_event):
         logger.info("Deepgram connection closed")
 
-    # Create Deepgram v1 connection
-    connection = client.listen.v1.connect(
+    # Create Deepgram v1 connection inside context manager
+    with client.listen.v1.connect(
         model="nova-3",
         encoding="linear16",
         sample_rate=16000,
@@ -105,54 +102,55 @@ async def websocket_transcribe(websocket: WebSocket):
         smart_format=True,
         endpointing=300,
         vad_events=True,
-    )
+    ) as connection:
+        connection.on(EventType.OPEN, on_open)
+        connection.on(EventType.MESSAGE, on_message)
+        connection.on(EventType.ERROR, on_error)
+        connection.on(EventType.CLOSE, on_close)
 
-    # Register callbacks
-    connection.on(EventType.OPEN, on_open)
-    connection.on(EventType.MESSAGE, on_message)
-    connection.on(EventType.ERROR, on_error)
-    connection.on(EventType.CLOSE, on_close)
+        # Start Deepgram listener in a background thread (non‑blocking)
+        listener_thread = threading.Thread(target=connection.start_listening, daemon=True)
+        listener_thread.start()
 
-    # Start Deepgram listener in a background thread (non‑blocking)
-    listener_thread = threading.Thread(target=connection.start_listening, daemon=True)
-    listener_thread.start()
+        try:
+            while True:
+                raw = await websocket.receive_text()
+                payload = json.loads(raw)
 
-    try:
-        # Main loop: receive JSON messages from frontend
-        while True:
-            raw = await websocket.receive_text()
-            payload = json.loads(raw)
-            
-            if payload.get("type") == "audio":
-                audio_b64 = payload.get("data", "")
-                audio_bytes = base64.b64decode(audio_b64)
-                logger.info(f"🎤 Received audio chunk: {len(audio_bytes)} bytes")
-                
-                # Log first few sample values to detect silence
-                sample_count = min(len(audio_bytes) // 2, 10)
-                samples = []
-                for i in range(sample_count):
-                    sample = int.from_bytes(audio_bytes[i*2:(i+1)*2], 'little', signed=True)
-                    samples.append(sample)
-                logger.info(f"First {sample_count} samples: {samples}")
-                
-                connection.send_media(audio_bytes)
-            
-            elif payload.get("type") == "stop":
-                logger.info("Stop command received")
+                if payload.get("type") == "audio":
+                    audio_b64 = payload.get("data", "")
+                    audio_bytes = base64.b64decode(audio_b64)
+                    logger.info(f"🎤 Received audio chunk: {len(audio_bytes)} bytes")
+
+                    sample_count = min(len(audio_bytes) // 2, 10)
+                    samples = []
+                    for i in range(sample_count):
+                        sample = int.from_bytes(audio_bytes[i*2:(i+1)*2], 'little', signed=True)
+                        samples.append(sample)
+                    logger.info(f"First {sample_count} samples: {samples}")
+
+                    connection.send_media(audio_bytes)
+
+                elif payload.get("type") == "stop":
+                    logger.info("Stop command received")
+                    break
+
+                else:
+                    logger.warning(f"Unknown message type: {payload.get('type')}")
+
+        except WebSocketDisconnect:
+            logger.info("Frontend WebSocket disconnected")
+            frontend_closed = True   # Prevent further send attempts
+        except Exception as e:
+            logger.exception("Backend error")
+            await send_json_safe({"type": "error", "message": str(e)})
+        finally:
+            # Gracefully close Deepgram stream even if frontend disconnected abruptly
+            try:
                 connection.send_finalize()
                 connection.send_close_stream()
-                break
-            
-            else:
-                logger.warning(f"Unknown message type: {payload.get('type')}")
+                logger.info("Sent finalize and close to Deepgram")
+            except Exception as e:
+                logger.warning(f"Failed to close Deepgram stream gracefully: {e}")
 
-    except WebSocketDisconnect:
-        logger.info("Frontend WebSocket disconnected")
-    except Exception as e:
-        logger.exception("Backend error")
-        await send_json_safe({"type": "error", "message": str(e)})
-    finally:
-        # Ensure Deepgram connection is closed
-        connection.close()
-        logger.info("Deepgram connection closed")
+    logger.info("Deepgram connection closed (context manager exited)")
