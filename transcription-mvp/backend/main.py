@@ -125,7 +125,6 @@ async def websocket_transcribe(websocket: WebSocket):
     # Deepgram connection – your original parameters (no changes)
     with client.listen.v1.connect(
         model="nova-3",
-        encoding="linear16",
         sample_rate=16000,
         language="en-US",
         interim_results=True,
