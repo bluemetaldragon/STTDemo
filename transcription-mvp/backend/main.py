@@ -126,6 +126,7 @@ async def websocket_transcribe(websocket: WebSocket):
     with client.listen.v1.connect(
         model="nova-3",
         sample_rate=16000,
+        encoding="linear16",
         language="en-US",
         interim_results=True,
         punctuate=True,
