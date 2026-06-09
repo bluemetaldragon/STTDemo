@@ -268,12 +268,14 @@ export default function TranscriptionApp() {
     if (isRecording || isBusy) return;
     setIsBusy(true);
     try {
-      setTranscript('');
+      resetTranscript();        // <-- clear old transcript
       await connect();
-      const ok = await startRecording();
-      if (!ok) disconnect();
-    } catch (e) { disconnect(); }
-    finally { setIsBusy(false); }
+      await startRecording();
+    } catch (e) {
+      disconnect();
+    } finally {
+      setIsBusy(false);
+    }
   };
 
   const handleStop = async () => {
