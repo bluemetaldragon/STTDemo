@@ -158,91 +158,71 @@ function useWebSocketTranscript(serverUrl) {
   };
 }
 
-
-// ---------- Audio capture (unchanged, but passes raw ArrayBuffer) ----------
 function useAudioCapture(onAudioChunk) {
   const [isRecording, setIsRecording] = useState(false);
   const [debugLogs, setDebugLogs] = useState([]);
-  const audioContextRef = useRef(null);
+  const mediaRecorderRef = useRef(null);
   const streamRef = useRef(null);
-  const workletNodeRef = useRef(null);
-  const sourceRef = useRef(null);
-  const isStartingRef = useRef(false);
 
-  const addLog = useCallback((msg) => {
+  const addLog = (msg) => {
     console.log('[AUDIO]', msg);
     setDebugLogs(prev => [...prev, `[${new Date().toLocaleTimeString()}] ${msg}`].slice(-20));
-  }, []);
-
-  const stopRecording = useCallback(async () => {
-    addLog('Stopping recording');
-    try {
-      workletNodeRef.current?.port.postMessage({ type: 'stop' });
-      workletNodeRef.current?.disconnect();
-      sourceRef.current?.disconnect();
-      streamRef.current?.getTracks().forEach(track => track.stop());
-      await audioContextRef.current?.close();
-    } catch (e) {}
-    setIsRecording(false);
-    isStartingRef.current = false;
-    addLog('✓ Recording stopped');
-  }, [addLog]);
+  };
 
   const startRecording = useCallback(async () => {
-    if (isRecording || isStartingRef.current) return true;
-    isStartingRef.current = true;
     addLog('Requesting microphone');
     try {
-      const stream = await navigator.mediaDevices.getUserMedia({
-        audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true, autoGainControl: true }
-      });
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
       streamRef.current = stream;
       addLog('✓ Microphone access granted');
 
-      const AudioContextClass = window.AudioContext || window.webkitAudioContext;
-      const audioContext = new AudioContextClass({ latencyHint: 'interactive' });
-      audioContextRef.current = audioContext;
-      addLog(`✓ AudioContext created (${audioContext.sampleRate} Hz)`);
-      if (audioContext.state === 'suspended') await audioContext.resume();
+      // Prefer WebM (works on Chrome/Firefox/Android) or fallback to MP4 (iOS)
+      const mimeType = MediaRecorder.isTypeSupported('audio/webm')
+        ? 'audio/webm'
+        : 'audio/mp4';
+      addLog(`Using MIME type: ${mimeType}`);
 
-      await audioContext.audioWorklet.addModule('/pcm-worklet.js');
-      addLog('✓ AudioWorklet loaded');
+      const mediaRecorder = new MediaRecorder(stream, { mimeType });
+      mediaRecorderRef.current = mediaRecorder;
 
-      const source = audioContext.createMediaStreamSource(stream);
-      sourceRef.current = source;
-      const workletNode = new AudioWorkletNode(audioContext, 'pcm-worklet', {
-        numberOfInputs: 1, numberOfOutputs: 0, channelCount: 1
-      });
-      workletNodeRef.current = workletNode;
-
-      let firstChunkSent = false;
-      workletNode.port.onmessage = (event) => {
-        const data = event.data;
-        if (data?.type === 'log') addLog(data.message);
-        if (data?.type === 'pcm' && data.buffer) {
-          const sent = onAudioChunk(data.buffer);
-          if (!firstChunkSent && sent) {
-            firstChunkSent = true;
-            addLog(`✓ First PCM chunk sent (${data.byteLength} bytes)`);
-          }
+      mediaRecorder.ondataavailable = (event) => {
+        if (event.data.size > 0) {
+          event.data.arrayBuffer().then(buffer => {
+            onAudioChunk(buffer);   // send raw binary over WebSocket
+          });
         }
       };
 
-      source.connect(workletNode);
+      // Send a chunk every 500ms (increase from 250ms to reduce overhead)
+      mediaRecorder.start(500);
       setIsRecording(true);
-      addLog('✓ Recording started (16kHz mono PCM16)');
-      isStartingRef.current = false;
+      addLog('✓ Recording started (MediaRecorder)');
       return true;
     } catch (error) {
       addLog(`❌ ${error.message}`);
-      await stopRecording();
       return false;
     }
-  }, [isRecording, onAudioChunk, addLog, stopRecording]);
+  }, [onAudioChunk, addLog]);
 
-  useEffect(() => { return () => stopRecording(); }, [stopRecording]);
+  const stopRecording = useCallback(() => {
+    addLog('Stopping recording');
+    if (mediaRecorderRef.current && mediaRecorderRef.current.state !== 'inactive') {
+      mediaRecorderRef.current.stop();
+    }
+    if (streamRef.current) {
+      streamRef.current.getTracks().forEach(track => track.stop());
+    }
+    setIsRecording(false);
+    addLog('✓ Stopped');
+  }, [addLog]);
+
+  useEffect(() => {
+    return () => stopRecording();
+  }, [stopRecording]);
+
   return { isRecording, startRecording, stopRecording, debugLogs };
 }
+
 
 // ---------- Main UI component ----------
 export default function TranscriptionApp() {
