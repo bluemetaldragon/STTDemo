@@ -153,7 +153,6 @@ function useWebSocketTranscript(serverUrl) {
   };
 }
 
-// ---------- Audio capture using MediaRecorder (no AudioWorklet) ----------
 function useAudioCapture(onAudioChunk) {
   const [isRecording, setIsRecording] = useState(false);
   const [debugLogs, setDebugLogs] = useState([]);
@@ -170,30 +169,55 @@ function useAudioCapture(onAudioChunk) {
     try {
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
       streamRef.current = stream;
-      addLog('✓ Microphone access granted');
+      const tracks = stream.getTracks();
+      addLog(`✓ Microphone access granted, tracks: ${tracks.length}, track state: ${tracks[0]?.readyState}`);
 
-      const mimeType = MediaRecorder.isTypeSupported('audio/webm')
-        ? 'audio/webm'
-        : 'audio/mp4';
-      addLog(`Using MIME type: ${mimeType}`);
+      // Check supported MIME types
+      const mimeTypes = ['audio/webm', 'audio/mp4', 'audio/webm;codecs=opus'];
+      let selectedMime = null;
+      for (const mime of mimeTypes) {
+        if (MediaRecorder.isTypeSupported(mime)) {
+          selectedMime = mime;
+          break;
+        }
+      }
+      addLog(`Using MIME type: ${selectedMime || 'default'}`);
 
-      const mediaRecorder = new MediaRecorder(stream, { mimeType });
+      const mediaRecorder = new MediaRecorder(stream, { mimeType: selectedMime });
       mediaRecorderRef.current = mediaRecorder;
 
+      // Log recorder errors
+      mediaRecorder.onerror = (event) => {
+        addLog(`❌ MediaRecorder error: ${event.error?.message || 'unknown'}`);
+      };
+
       mediaRecorder.ondataavailable = (event) => {
+        addLog(`📦 Data available: ${event.data.size} bytes`);
         if (event.data.size > 0) {
           event.data.arrayBuffer().then(buffer => {
-            onAudioChunk(buffer);
-          });
+            addLog(`Sending chunk to WebSocket, size: ${buffer.byteLength}`);
+            const sent = onAudioChunk(buffer);
+            addLog(`Chunk sent: ${sent ? 'yes' : 'no (WebSocket not open)'}`);
+          }).catch(err => addLog(`ArrayBuffer error: ${err.message}`));
         }
       };
 
+      // Start recording – request data every 500ms
       mediaRecorder.start(500);
+      addLog(`MediaRecorder started, state: ${mediaRecorder.state}`);
+
+      // If after 2 seconds no data arrives, log a warning
+      setTimeout(() => {
+        if (mediaRecorder.state === 'recording') {
+          addLog('⚠️ Still recording but no data available event fired yet');
+        }
+      }, 2000);
+
       setIsRecording(true);
       addLog('✓ Recording started (MediaRecorder)');
       return true;
     } catch (error) {
-      addLog(`❌ ${error.message}`);
+      addLog(`❌ ${error.name}: ${error.message}`);
       return false;
     }
   }, [onAudioChunk, addLog]);
@@ -202,6 +226,7 @@ function useAudioCapture(onAudioChunk) {
     addLog('Stopping recording');
     if (mediaRecorderRef.current && mediaRecorderRef.current.state !== 'inactive') {
       mediaRecorderRef.current.stop();
+      addLog('MediaRecorder stopped');
     }
     if (streamRef.current) {
       streamRef.current.getTracks().forEach(track => track.stop());
