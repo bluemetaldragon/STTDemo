@@ -1,6 +1,6 @@
 import React, { useState, useRef, useEffect, useCallback } from 'react';
 
-// ---------- WebSocket hook with binary audio ----------
+// ---------- WebSocket hook with binary audio and ping ----------
 function useWebSocketTranscript(serverUrl) {
   const [wsStatus, setWsStatus] = useState('idle');
   const [finalTranscript, setFinalTranscript] = useState('');
@@ -11,6 +11,7 @@ function useWebSocketTranscript(serverUrl) {
   const reconnectAttemptsRef = useRef(0);
   const reconnectTimerRef = useRef(null);
   const manualCloseRef = useRef(false);
+  const pingIntervalRef = useRef(null);
 
   const addWsLog = useCallback((msg) => {
     console.log('[WS]', msg);
@@ -35,15 +36,14 @@ function useWebSocketTranscript(serverUrl) {
         ws.binaryType = 'arraybuffer';
         wsRef.current = ws;
         manualCloseRef.current = false;
-        let pingInterval = null;
 
         ws.onopen = () => {
           addWsLog('✓ WebSocket connected');
           setWsStatus('connected');
           reconnectAttemptsRef.current = 0;
           resolve(ws);
-          // Send a ping every 5 seconds to keep the connection alive (optional)
-          pingInterval = setInterval(() => {
+          if (pingIntervalRef.current) clearInterval(pingIntervalRef.current);
+          pingIntervalRef.current = setInterval(() => {
             if (ws.readyState === WebSocket.OPEN) {
               ws.send(JSON.stringify({ type: 'ping' }));
             }
@@ -57,11 +57,9 @@ function useWebSocketTranscript(serverUrl) {
               if (msg.type === 'transcript' && msg.text) {
                 addWsLog(`📝 Transcript: "${msg.text}" ${msg.final ? '(final)' : '(interim)'}`);
                 if (msg.final === true) {
-                  // Final: append to permanent transcript and clear interim
                   setFinalTranscript(prev => prev + (prev ? ' ' : '') + msg.text);
                   setInterimTranscript('');
                 } else {
-                  // Interim: replace the temporary transcript
                   setInterimTranscript(msg.text);
                 }
               } else if (msg.type === 'error') {
@@ -69,10 +67,6 @@ function useWebSocketTranscript(serverUrl) {
                 setError(msg.message);
               } else if (msg.type === 'deepgram_ready') {
                 addWsLog('🎙️ Deepgram ready');
-              } else if (msg.type === 'speech_started') {
-                addWsLog('🎤 Speech detected');
-              } else if (msg.type === 'utterance_end') {
-                addWsLog('⏹ Utterance ended');
               }
             } catch (e) {
               addWsLog(`❌ Parse error: ${e.message}`);
@@ -87,7 +81,7 @@ function useWebSocketTranscript(serverUrl) {
         };
 
         ws.onclose = (event) => {
-          if (pingInterval) clearInterval(pingInterval);
+          if (pingIntervalRef.current) clearInterval(pingIntervalRef.current);
           addWsLog(`❌ Closed (code=${event.code})`);
           wsRef.current = null;
           setWsStatus('idle');
@@ -117,6 +111,7 @@ function useWebSocketTranscript(serverUrl) {
   const disconnect = useCallback(() => {
     clearReconnectTimer();
     manualCloseRef.current = true;
+    if (pingIntervalRef.current) clearInterval(pingIntervalRef.current);
     if (wsRef.current) {
       try {
         if (wsRef.current.readyState === WebSocket.OPEN) {
@@ -138,11 +133,11 @@ function useWebSocketTranscript(serverUrl) {
     return () => {
       manualCloseRef.current = true;
       clearReconnectTimer();
+      if (pingIntervalRef.current) clearInterval(pingIntervalRef.current);
       wsRef.current?.close();
     };
   }, [clearReconnectTimer]);
 
-  // Combine final and interim for display
   const displayTranscript = finalTranscript + (interimTranscript ? ' ' + interimTranscript : '');
 
   return {
@@ -158,16 +153,17 @@ function useWebSocketTranscript(serverUrl) {
   };
 }
 
+// ---------- Audio capture using MediaRecorder (no AudioWorklet) ----------
 function useAudioCapture(onAudioChunk) {
   const [isRecording, setIsRecording] = useState(false);
   const [debugLogs, setDebugLogs] = useState([]);
   const mediaRecorderRef = useRef(null);
   const streamRef = useRef(null);
 
-  const addLog = (msg) => {
+  const addLog = useCallback((msg) => {
     console.log('[AUDIO]', msg);
     setDebugLogs(prev => [...prev, `[${new Date().toLocaleTimeString()}] ${msg}`].slice(-20));
-  };
+  }, []);
 
   const startRecording = useCallback(async () => {
     addLog('Requesting microphone');
@@ -176,7 +172,6 @@ function useAudioCapture(onAudioChunk) {
       streamRef.current = stream;
       addLog('✓ Microphone access granted');
 
-      // Prefer WebM (works on Chrome/Firefox/Android) or fallback to MP4 (iOS)
       const mimeType = MediaRecorder.isTypeSupported('audio/webm')
         ? 'audio/webm'
         : 'audio/mp4';
@@ -188,12 +183,11 @@ function useAudioCapture(onAudioChunk) {
       mediaRecorder.ondataavailable = (event) => {
         if (event.data.size > 0) {
           event.data.arrayBuffer().then(buffer => {
-            onAudioChunk(buffer);   // send raw binary over WebSocket
+            onAudioChunk(buffer);
           });
         }
       };
 
-      // Send a chunk every 500ms (increase from 250ms to reduce overhead)
       mediaRecorder.start(500);
       setIsRecording(true);
       addLog('✓ Recording started (MediaRecorder)');
@@ -217,12 +211,18 @@ function useAudioCapture(onAudioChunk) {
   }, [addLog]);
 
   useEffect(() => {
-    return () => stopRecording();
-  }, [stopRecording]);
+    return () => {
+      if (mediaRecorderRef.current && mediaRecorderRef.current.state !== 'inactive') {
+        mediaRecorderRef.current.stop();
+      }
+      if (streamRef.current) {
+        streamRef.current.getTracks().forEach(track => track.stop());
+      }
+    };
+  }, []);
 
   return { isRecording, startRecording, stopRecording, debugLogs };
 }
-
 
 // ---------- Main UI component ----------
 export default function TranscriptionApp() {
@@ -248,12 +248,11 @@ export default function TranscriptionApp() {
     if (isRecording || isBusy) return;
     setIsBusy(true);
     try {
-      resetTranscript();   // clear old transcript
+      resetTranscript();
       await connect();
       const ok = await startRecording();
       if (!ok) disconnect();
     } catch (e) {
-      console.error(e);
       disconnect();
     } finally {
       setIsBusy(false);
@@ -266,7 +265,9 @@ export default function TranscriptionApp() {
     try {
       await stopRecording();
       disconnect();
-    } finally { setIsBusy(false); }
+    } finally {
+      setIsBusy(false);
+    }
   };
 
   const copyTranscript = async () => {
@@ -274,14 +275,16 @@ export default function TranscriptionApp() {
       await navigator.clipboard.writeText(transcript);
       setCopyStatus('Copied!');
       setTimeout(() => setCopyStatus(''), 2000);
-    } catch { setCopyStatus('Copy failed'); }
+    } catch {
+      setCopyStatus('Copy failed');
+    }
   };
 
   return (
     <div style={{ minHeight: '100vh', backgroundColor: '#f9fafb', fontFamily: 'system-ui' }}>
       <div style={{ backgroundColor: '#fff', borderBottom: '1px solid #e5e7eb', padding: '1rem' }}>
         <h1 style={{ margin: 0, fontSize: '1.5rem', fontWeight: 600 }}>Real-Time Transcription</h1>
-        <p style={{ margin: 0, fontSize: '0.875rem', color: '#6b7280' }}>Binary audio streaming</p>
+        <p style={{ margin: 0, fontSize: '0.875rem', color: '#6b7280' }}>Binary audio streaming (MediaRecorder)</p>
       </div>
 
       <div style={{ maxWidth: '1000px', margin: '0 auto', padding: '1.5rem 1rem' }}>
