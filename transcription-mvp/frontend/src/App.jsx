@@ -152,12 +152,12 @@ function useWebSocketTranscript(serverUrl) {
     resetTranscript,
   };
 }
-
 function useAudioCapture(onAudioChunk) {
   const [isRecording, setIsRecording] = useState(false);
   const [debugLogs, setDebugLogs] = useState([]);
   const mediaRecorderRef = useRef(null);
   const streamRef = useRef(null);
+  const requestIntervalRef = useRef(null);
 
   const addLog = useCallback((msg) => {
     console.log('[AUDIO]', msg);
@@ -169,85 +169,75 @@ function useAudioCapture(onAudioChunk) {
     try {
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
       streamRef.current = stream;
-      const tracks = stream.getTracks();
-      addLog(`✓ Microphone access granted, tracks: ${tracks.length}, track state: ${tracks[0]?.readyState}`);
+      addLog(`✓ Microphone granted (tracks: ${stream.getTracks().length})`);
 
-      // Check supported MIME types
+      // Find supported MIME type
       const mimeTypes = ['audio/webm', 'audio/mp4', 'audio/webm;codecs=opus'];
-      let selectedMime = null;
-      for (const mime of mimeTypes) {
-        if (MediaRecorder.isTypeSupported(mime)) {
-          selectedMime = mime;
+      let mimeType = '';
+      for (const mt of mimeTypes) {
+        if (MediaRecorder.isTypeSupported(mt)) {
+          mimeType = mt;
           break;
         }
       }
-      addLog(`Using MIME type: ${selectedMime || 'default'}`);
+      addLog(`Using MIME: ${mimeType || 'default'}`);
 
-      const mediaRecorder = new MediaRecorder(stream, { mimeType: selectedMime });
+      const mediaRecorder = new MediaRecorder(stream, { mimeType });
       mediaRecorderRef.current = mediaRecorder;
 
-      // Log recorder errors
-      mediaRecorder.onerror = (event) => {
-        addLog(`❌ MediaRecorder error: ${event.error?.message || 'unknown'}`);
-      };
-
       mediaRecorder.ondataavailable = (event) => {
-        addLog(`📦 Data available: ${event.data.size} bytes`);
+        addLog(`📦 dataavailable: ${event.data.size} bytes`);
         if (event.data.size > 0) {
           event.data.arrayBuffer().then(buffer => {
-            addLog(`Sending chunk to WebSocket, size: ${buffer.byteLength}`);
-            const sent = onAudioChunk(buffer);
-            addLog(`Chunk sent: ${sent ? 'yes' : 'no (WebSocket not open)'}`);
-          }).catch(err => addLog(`ArrayBuffer error: ${err.message}`));
+            addLog(`Sending chunk (${buffer.byteLength} bytes)`);
+            onAudioChunk(buffer);
+          });
         }
       };
 
-      // Start recording – request data every 500ms
-      mediaRecorder.start(500);
-      addLog(`MediaRecorder started, state: ${mediaRecorder.state}`);
+      mediaRecorder.onerror = (e) => addLog(`Recorder error: ${e.error?.message}`);
 
-      // If after 2 seconds no data arrives, log a warning
-      setTimeout(() => {
+      // Start recording – request data every 500ms normally
+      mediaRecorder.start(500);
+      addLog(`Recorder started, state=${mediaRecorder.state}`);
+
+      // Android workaround: force requestData every second
+      if (requestIntervalRef.current) clearInterval(requestIntervalRef.current);
+      requestIntervalRef.current = setInterval(() => {
         if (mediaRecorder.state === 'recording') {
-          addLog('⚠️ Still recording but no data available event fired yet');
+          mediaRecorder.requestData();
+          addLog('Manual requestData() sent');
         }
-      }, 2000);
+      }, 1000);
 
       setIsRecording(true);
-      addLog('✓ Recording started (MediaRecorder)');
       return true;
-    } catch (error) {
-      addLog(`❌ ${error.name}: ${error.message}`);
+    } catch (err) {
+      addLog(`❌ ${err.name}: ${err.message}`);
       return false;
     }
   }, [onAudioChunk, addLog]);
 
   const stopRecording = useCallback(() => {
-    addLog('Stopping recording');
+    addLog('Stopping');
+    if (requestIntervalRef.current) clearInterval(requestIntervalRef.current);
     if (mediaRecorderRef.current && mediaRecorderRef.current.state !== 'inactive') {
       mediaRecorderRef.current.stop();
-      addLog('MediaRecorder stopped');
     }
     if (streamRef.current) {
-      streamRef.current.getTracks().forEach(track => track.stop());
+      streamRef.current.getTracks().forEach(t => t.stop());
     }
     setIsRecording(false);
-    addLog('✓ Stopped');
   }, [addLog]);
 
   useEffect(() => {
-    return () => {
-      if (mediaRecorderRef.current && mediaRecorderRef.current.state !== 'inactive') {
-        mediaRecorderRef.current.stop();
-      }
-      if (streamRef.current) {
-        streamRef.current.getTracks().forEach(track => track.stop());
-      }
-    };
-  }, []);
+    return () => stopRecording();
+  }, [stopRecording]);
 
   return { isRecording, startRecording, stopRecording, debugLogs };
 }
+
+
 
 // ---------- Main UI component ----------
 export default function TranscriptionApp() {
